@@ -15,6 +15,8 @@ import requests
 logger = logging.getLogger("agnost.conversation.events")
 
 FLUSH_TIMEOUT_SECONDS = 10.0
+MAX_QUEUE_SIZE = 10000
+MAX_ATTEMPTS = 3
 
 
 class EventProcessor:
@@ -27,7 +29,7 @@ class EventProcessor:
     def __init__(self, endpoint: str, org_id: str):
         self.endpoint = endpoint
         self.org_id = org_id
-        self._queue: Queue = Queue()
+        self._queue: Queue = Queue(maxsize=MAX_QUEUE_SIZE)
         self._session = requests.Session()
         self._worker_thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
@@ -57,20 +59,34 @@ class EventProcessor:
 
     def _send_event(self, event_data: Dict[str, Any]) -> None:
         """Send event to API."""
-        try:
-            response = self._session.post(
-                f"{self.endpoint}/api/v1/capture-event",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Org-Id": self.org_id,
-                },
-                json=event_data,
-                timeout=10
-            )
-            response.raise_for_status()
-            logger.debug(f"Event sent successfully: {event_data.get('event_id', 'unknown')}")
-        except Exception as e:
-            logger.error(f"Failed to send event: {e}")
+        self._post("/api/v1/capture-event", event_data)
+
+    def _post(self, path: str, payload: Dict[str, Any]) -> bool:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = self._session.post(
+                    f"{self.endpoint}{path}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Org-Id": self.org_id,
+                    },
+                    json=payload,
+                    timeout=10
+                )
+                if response.status_code < 500:
+                    response.raise_for_status()
+                    logger.debug(f"Sent {path}: {payload.get('event_id') or payload.get('session_id')}")
+                    return True
+                logger.warning(f"{path} returned {response.status_code} (attempt {attempt})")
+            except requests.HTTPError as e:
+                logger.error(f"{path} rejected: {e}")
+                return False
+            except Exception as e:
+                logger.warning(f"{path} failed (attempt {attempt}): {e}")
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(0.5 * 2 ** (attempt - 1))
+        logger.error(f"Dropping {path} after {MAX_ATTEMPTS} attempts")
+        return False
 
     def queue_event(self, event_data: Dict[str, Any]) -> bool:
         """
@@ -112,7 +128,10 @@ class EventProcessor:
 
         self.flush()
         self._shutdown_event.set()
-        self._queue.put(None)
+        try:
+            self._queue.put(None, block=False)
+        except Full:
+            pass
 
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=5.0)
