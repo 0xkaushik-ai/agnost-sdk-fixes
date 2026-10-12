@@ -51,15 +51,13 @@ class EventProcessor:
             try:
                 if event_data is None:
                     return
-                self._send_event(event_data)
+                path, payload = event_data
+                self._post(path, payload)
             except Exception as e:
                 logger.error(f"Worker error: {e}")
             finally:
                 self._queue.task_done()
 
-    def _send_event(self, event_data: Dict[str, Any]) -> None:
-        """Send event to API."""
-        self._post("/api/v1/capture-event", event_data)
 
     def _post(self, path: str, payload: Dict[str, Any]) -> bool:
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -98,9 +96,15 @@ class EventProcessor:
         Returns:
             bool: True if queued successfully
         """
+        return self._enqueue("/api/v1/capture-event", event_data)
+
+    def queue_session(self, session_payload: Dict[str, Any]) -> bool:
+        return self._enqueue("/api/v1/capture-session", session_payload)
+
+    def _enqueue(self, path: str, payload: Dict[str, Any]) -> bool:
         try:
-            self._queue.put(event_data, block=False)
-            logger.debug(f"Event queued for processing")
+            self._queue.put((path, payload), block=False)
+            logger.debug(f"Queued {path}")
             return True
         except Full:
             logger.warning("Event queue is full, dropping event")

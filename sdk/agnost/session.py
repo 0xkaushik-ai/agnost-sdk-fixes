@@ -6,7 +6,7 @@ This module handles conversation sessions and user identification.
 
 import uuid
 import logging
-from typing import Dict, Optional, Any
+from typing import Any, Callable, Dict, Optional
 from datetime import datetime
 
 import requests
@@ -24,12 +24,14 @@ class SessionManager:
         endpoint: str,
         org_id: str,
         config: ConversationConfig,
-        http_session: Optional[requests.Session] = None
+        http_session: Optional[requests.Session] = None,
+        queue_session: Optional[Callable[[Dict[str, Any]], bool]] = None
     ):
         self.endpoint = endpoint
         self.org_id = org_id
         self.config = config
         self._session = http_session or requests.Session()
+        self._queue_session = queue_session
         self._conversations: Dict[str, str] = {}  # conversation_id -> session_id mapping
         self._user_traits: Dict[str, UserTraits] = {}  # user_id -> traits mapping
         logger.debug(f"SessionManager initialized for org: {org_id}")
@@ -93,24 +95,15 @@ class SessionManager:
                 "user_data": user_data,
             }
 
-            response = self._session.post(
-                f"{self.endpoint}/api/v1/capture-session",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Org-Id": self.org_id,
-                },
-                json=session_payload,
-                timeout=10
-            )
-            response.raise_for_status()
+            if not self._queue_session(session_payload):
+                logger.error(f"Failed to queue conversation: {conversation_id}")
+                return conversation_id
             self._conversations[conversation_id] = conversation_id
-            logger.info(f"New conversation created: {conversation_id} for user: {user_id}")
+            logger.debug(f"New conversation queued: {conversation_id} for user: {user_id}")
             return conversation_id
 
         except Exception as e:
             logger.error(f"Failed to create conversation: {e}")
-            # Still track locally even if API fails
-            self._conversations[conversation_id] = conversation_id
             return conversation_id
 
     def identify_user(self, user_id: str, traits: UserTraits) -> bool:

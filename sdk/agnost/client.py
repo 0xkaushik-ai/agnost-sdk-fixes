@@ -104,7 +104,8 @@ class ConversationClient:
                 self._config.endpoint,
                 write_key,
                 self._config,
-                self._http_session
+                self._http_session,
+                queue_session=self._event_processor.queue_session,
             )
 
             # Register shutdown handler
