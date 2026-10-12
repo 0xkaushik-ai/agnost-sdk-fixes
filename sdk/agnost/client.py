@@ -33,7 +33,7 @@ class ConversationClient:
     and identify users.
 
     Example:
-        import agnost_conversation as agnost
+        import agnost
 
         agnost.init("your-org-id")
 

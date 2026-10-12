@@ -4,7 +4,7 @@ Agnost Conversation SDK
 A Python SDK for tracking AI conversations and events.
 
 Example:
-    import agnost_conversation as agnost
+    import agnost
 
     # Initialize with your organization ID
     agnost.init("your-org-id")
@@ -85,7 +85,7 @@ def init(write_key: str, config: ConversationConfig = None, **kwargs) -> bool:
         bool: True if initialization was successful
 
     Example:
-        import agnost_conversation as agnost
+        import agnost
 
         # Basic initialization
         agnost.init("your-org-id")
