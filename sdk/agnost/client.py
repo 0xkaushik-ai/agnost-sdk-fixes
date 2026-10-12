@@ -9,7 +9,7 @@ import uuid
 import logging
 import atexit
 from typing import Any, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -160,7 +160,9 @@ class ConversationClient:
 
         try:
             event_id = str(uuid.uuid4())
-            ts = timestamp or datetime.utcnow()
+            ts = timestamp or datetime.now(timezone.utc)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
 
             # Ensure conversation exists
             session_id = self._session_manager.get_or_create_conversation(
@@ -185,6 +187,7 @@ class ConversationClient:
                 "args": "" if input is None else json.dumps(input),
                 "result": "" if output is None else json.dumps(output),
                 "metadata": event_metadata,
+                "timestamp": ts.isoformat(),
             }
 
             # Queue for processing
