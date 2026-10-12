@@ -1,0 +1,326 @@
+diff --git a/sdk/agnost/__init__.py b/sdk/agnost/__init__.py
+index 5b31357..c98845b 100644
+--- a/sdk/agnost/__init__.py
++++ b/sdk/agnost/__init__.py
+@@ -4,7 +4,7 @@ Agnost Conversation SDK
+ A Python SDK for tracking AI conversations and events.
+ 
+ Example:
+-    import agnost_conversation as agnost
++    import agnost
+ 
+     # Initialize with your organization ID
+     agnost.init("your-org-id")
+@@ -85,7 +85,7 @@ def init(write_key: str, config: ConversationConfig = None, **kwargs) -> bool:
+         bool: True if initialization was successful
+ 
+     Example:
+-        import agnost_conversation as agnost
++        import agnost
+ 
+         # Basic initialization
+         agnost.init("your-org-id")
+diff --git a/sdk/agnost/client.py b/sdk/agnost/client.py
+index 16b8c7a..2d7812e 100644
+--- a/sdk/agnost/client.py
++++ b/sdk/agnost/client.py
+@@ -9,7 +9,7 @@ import uuid
+ import logging
+ import atexit
+ from typing import Any, Optional, Dict
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ import requests
+ 
+@@ -33,7 +33,7 @@ class ConversationClient:
+     and identify users.
+ 
+     Example:
+-        import agnost_conversation as agnost
++        import agnost
+ 
+         agnost.init("your-org-id")
+ 
+@@ -85,9 +85,7 @@ class ConversationClient:
+ 
+             # Set up logging
+             if self._config.debug:
+-                logging.getLogger("agnost.conversation").setLevel(logging.DEBUG)
+-                logging.getLogger("agnost.conversation.events").setLevel(logging.DEBUG)
+-                logging.getLogger("agnost.conversation.session").setLevel(logging.DEBUG)
++                self.set_debug_logs(True)
+ 
+             logger.info(f"Initializing Agnost Conversation SDK - Endpoint: {self._config.endpoint}")
+ 
+@@ -104,7 +102,8 @@ class ConversationClient:
+                 self._config.endpoint,
+                 write_key,
+                 self._config,
+-                self._http_session
++                self._http_session,
++                queue_session=self._event_processor.queue_session,
+             )
+ 
+             # Register shutdown handler
+@@ -159,7 +158,9 @@ class ConversationClient:
+ 
+         try:
+             event_id = str(uuid.uuid4())
+-            ts = timestamp or datetime.utcnow()
++            ts = timestamp or datetime.now(timezone.utc)
++            if ts.tzinfo is None:
++                ts = ts.replace(tzinfo=timezone.utc)
+ 
+             # Ensure conversation exists
+             session_id = self._session_manager.get_or_create_conversation(
+@@ -170,7 +171,7 @@ class ConversationClient:
+             event_metadata = {}
+             if properties:
+                 for k, v in properties.items():
+-                    event_metadata[str(k)] = str(v)
++                    event_metadata[str(k)] = v if isinstance(v, str) else json.dumps(v, default=str)
+             event_metadata["event_type"] = event
+ 
+             # Build event data
+@@ -184,6 +185,7 @@ class ConversationClient:
+                 "args": "" if input is None else json.dumps(input),
+                 "result": "" if output is None else json.dumps(output),
+                 "metadata": event_metadata,
++                "timestamp": ts.isoformat(),
+             }
+ 
+             # Queue for processing
+@@ -364,6 +366,11 @@ class ConversationClient:
+             enabled: True to enable debug logs, False to disable
+         """
+         level = logging.DEBUG if enabled else logging.INFO
++        root = logging.getLogger("agnost.conversation")
++        if enabled and not root.handlers and not logging.getLogger().handlers:
++            handler = logging.StreamHandler()
++            handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s %(message)s"))
++            root.addHandler(handler)
+         logging.getLogger("agnost.conversation").setLevel(level)
+         logging.getLogger("agnost.conversation.events").setLevel(level)
+         logging.getLogger("agnost.conversation.session").setLevel(level)
+diff --git a/sdk/agnost/events.py b/sdk/agnost/events.py
+index 4ccfeda..163ac3b 100644
+--- a/sdk/agnost/events.py
++++ b/sdk/agnost/events.py
+@@ -7,13 +7,17 @@ This module handles event processing in background threads.
+ import logging
+ import threading
+ import time
+-from queue import Queue, Empty, Full
+-from typing import Any, Dict, List, Optional
++from queue import Queue, Full
++from typing import Any, Dict, Optional
+ 
+ import requests
+ 
+ logger = logging.getLogger("agnost.conversation.events")
+ 
++FLUSH_TIMEOUT_SECONDS = 10.0
++MAX_QUEUE_SIZE = 10000
++MAX_ATTEMPTS = 3
++
+ 
+ class EventProcessor:
+     """
+@@ -25,7 +29,7 @@ class EventProcessor:
+     def __init__(self, endpoint: str, org_id: str):
+         self.endpoint = endpoint
+         self.org_id = org_id
+-        self._queue: Queue = Queue()
++        self._queue: Queue = Queue(maxsize=MAX_QUEUE_SIZE)
+         self._session = requests.Session()
+         self._worker_thread: Optional[threading.Thread] = None
+         self._shutdown_event = threading.Event()
+@@ -42,32 +46,45 @@ class EventProcessor:
+ 
+     def _worker_loop(self) -> None:
+         """Background worker loop."""
+-        while not self._shutdown_event.is_set():
++        while True:
++            event_data = self._queue.get()
+             try:
+-                event_data = self._queue.get(timeout=1.0)
+-                self._send_event(event_data)
+-                self._queue.task_done()
+-            except Empty:
+-                continue
++                if event_data is None:
++                    return
++                path, payload = event_data
++                self._post(path, payload)
+             except Exception as e:
+                 logger.error(f"Worker error: {e}")
++            finally:
++                self._queue.task_done()
+ 
+-    def _send_event(self, event_data: Dict[str, Any]) -> None:
+-        """Send event to API."""
+-        try:
+-            response = self._session.post(
+-                f"{self.endpoint}/api/v1/capture-event",
+-                headers={
+-                    "Content-Type": "application/json",
+-                    "X-Org-Id": self.org_id,
+-                },
+-                json=event_data,
+-                timeout=10
+-            )
+-            response.raise_for_status()
+-            logger.debug(f"Event sent successfully: {event_data.get('event_id', 'unknown')}")
+-        except Exception as e:
+-            logger.error(f"Failed to send event: {e}")
++
++    def _post(self, path: str, payload: Dict[str, Any]) -> bool:
++        for attempt in range(1, MAX_ATTEMPTS + 1):
++            try:
++                response = self._session.post(
++                    f"{self.endpoint}{path}",
++                    headers={
++                        "Content-Type": "application/json",
++                        "X-Org-Id": self.org_id,
++                    },
++                    json=payload,
++                    timeout=10
++                )
++                if response.status_code < 500:
++                    response.raise_for_status()
++                    logger.debug(f"Sent {path}: {payload.get('event_id') or payload.get('session_id')}")
++                    return True
++                logger.warning(f"{path} returned {response.status_code} (attempt {attempt})")
++            except requests.HTTPError as e:
++                logger.error(f"{path} rejected: {e}")
++                return False
++            except Exception as e:
++                logger.warning(f"{path} failed (attempt {attempt}): {e}")
++            if attempt < MAX_ATTEMPTS:
++                time.sleep(0.5 * 2 ** (attempt - 1))
++        logger.error(f"Dropping {path} after {MAX_ATTEMPTS} attempts")
++        return False
+ 
+     def queue_event(self, event_data: Dict[str, Any]) -> bool:
+         """
+@@ -79,9 +96,15 @@ class EventProcessor:
+         Returns:
+             bool: True if queued successfully
+         """
++        return self._enqueue("/api/v1/capture-event", event_data)
++
++    def queue_session(self, session_payload: Dict[str, Any]) -> bool:
++        return self._enqueue("/api/v1/capture-session", session_payload)
++
++    def _enqueue(self, path: str, payload: Dict[str, Any]) -> bool:
+         try:
+-            self._queue.put(event_data, block=False)
+-            logger.debug(f"Event queued for processing")
++            self._queue.put((path, payload), block=False)
++            logger.debug(f"Queued {path}")
+             return True
+         except Full:
+             logger.warning("Event queue is full, dropping event")
+@@ -90,28 +113,29 @@ class EventProcessor:
+             logger.error(f"Failed to queue event: {e}")
+             return False
+ 
+-    def flush(self) -> None:
+-        """Manually flush all queued events."""
++    def flush(self, timeout: float = FLUSH_TIMEOUT_SECONDS) -> bool:
++        """Wait until all queued events have been sent."""
+         logger.debug("Manual flush requested")
+-
+-        # Process all queued events
+-        while True:
+-            try:
+-                event_data = self._queue.get_nowait()
+-                self._send_event(event_data)
+-                self._queue.task_done()
+-            except Empty:
+-                break
++        deadline = time.monotonic() + timeout
++        with self._queue.all_tasks_done:
++            while self._queue.unfinished_tasks:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    logger.warning(f"flush() timed out with {self._queue.unfinished_tasks} events pending")
++                    return False
++                self._queue.all_tasks_done.wait(remaining)
++        return True
+ 
+     def shutdown(self) -> None:
+         """Shutdown processor and flush remaining events."""
+         logger.info("Shutting down EventProcessor")
+ 
+-        # Flush remaining events
+         self.flush()
+-
+-        # Signal shutdown
+         self._shutdown_event.set()
++        try:
++            self._queue.put(None, block=False)
++        except Full:
++            pass
+ 
+         if self._worker_thread and self._worker_thread.is_alive():
+             self._worker_thread.join(timeout=5.0)
+diff --git a/sdk/agnost/session.py b/sdk/agnost/session.py
+index 73539ab..1bb80fa 100644
+--- a/sdk/agnost/session.py
++++ b/sdk/agnost/session.py
+@@ -6,7 +6,7 @@ This module handles conversation sessions and user identification.
+ 
+ import uuid
+ import logging
+-from typing import Dict, Optional, Any
++from typing import Any, Callable, Dict, Optional
+ from datetime import datetime
+ 
+ import requests
+@@ -24,12 +24,14 @@ class SessionManager:
+         endpoint: str,
+         org_id: str,
+         config: ConversationConfig,
+-        http_session: Optional[requests.Session] = None
++        http_session: Optional[requests.Session] = None,
++        queue_session: Optional[Callable[[Dict[str, Any]], bool]] = None
+     ):
+         self.endpoint = endpoint
+         self.org_id = org_id
+         self.config = config
+         self._session = http_session or requests.Session()
++        self._queue_session = queue_session
+         self._conversations: Dict[str, str] = {}  # conversation_id -> session_id mapping
+         self._user_traits: Dict[str, UserTraits] = {}  # user_id -> traits mapping
+         logger.debug(f"SessionManager initialized for org: {org_id}")
+@@ -93,24 +95,15 @@ class SessionManager:
+                 "user_data": user_data,
+             }
+ 
+-            response = self._session.post(
+-                f"{self.endpoint}/api/v1/capture-session",
+-                headers={
+-                    "Content-Type": "application/json",
+-                    "X-Org-Id": self.org_id,
+-                },
+-                json=session_payload,
+-                timeout=10
+-            )
+-            response.raise_for_status()
++            if not self._queue_session(session_payload):
++                logger.error(f"Failed to queue conversation: {conversation_id}")
++                return conversation_id
+             self._conversations[conversation_id] = conversation_id
+-            logger.info(f"New conversation created: {conversation_id} for user: {user_id}")
++            logger.debug(f"New conversation queued: {conversation_id} for user: {user_id}")
+             return conversation_id
+ 
+         except Exception as e:
+             logger.error(f"Failed to create conversation: {e}")
+-            # Still track locally even if API fails
+-            self._conversations[conversation_id] = conversation_id
+             return conversation_id
+ 
+     def identify_user(self, user_id: str, traits: UserTraits) -> bool:
