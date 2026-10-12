@@ -85,9 +85,7 @@ class ConversationClient:
 
             # Set up logging
             if self._config.debug:
-                logging.getLogger("agnost.conversation").setLevel(logging.DEBUG)
-                logging.getLogger("agnost.conversation.events").setLevel(logging.DEBUG)
-                logging.getLogger("agnost.conversation.session").setLevel(logging.DEBUG)
+                self.set_debug_logs(True)
 
             logger.info(f"Initializing Agnost Conversation SDK - Endpoint: {self._config.endpoint}")
 
@@ -368,6 +366,11 @@ class ConversationClient:
             enabled: True to enable debug logs, False to disable
         """
         level = logging.DEBUG if enabled else logging.INFO
+        root = logging.getLogger("agnost.conversation")
+        if enabled and not root.handlers and not logging.getLogger().handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s %(message)s"))
+            root.addHandler(handler)
         logging.getLogger("agnost.conversation").setLevel(level)
         logging.getLogger("agnost.conversation.events").setLevel(level)
         logging.getLogger("agnost.conversation.session").setLevel(level)
