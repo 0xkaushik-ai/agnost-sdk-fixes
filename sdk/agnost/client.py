@@ -171,7 +171,7 @@ class ConversationClient:
             event_metadata = {}
             if properties:
                 for k, v in properties.items():
-                    event_metadata[str(k)] = str(v)
+                    event_metadata[str(k)] = v if isinstance(v, str) else json.dumps(v, default=str)
             event_metadata["event_type"] = event
 
             # Build event data
