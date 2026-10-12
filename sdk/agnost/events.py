@@ -7,12 +7,14 @@ This module handles event processing in background threads.
 import logging
 import threading
 import time
-from queue import Queue, Empty, Full
-from typing import Any, Dict, List, Optional
+from queue import Queue, Full
+from typing import Any, Dict, Optional
 
 import requests
 
 logger = logging.getLogger("agnost.conversation.events")
+
+FLUSH_TIMEOUT_SECONDS = 10.0
 
 
 class EventProcessor:
@@ -42,15 +44,16 @@ class EventProcessor:
 
     def _worker_loop(self) -> None:
         """Background worker loop."""
-        while not self._shutdown_event.is_set():
+        while True:
+            event_data = self._queue.get()
             try:
-                event_data = self._queue.get(timeout=1.0)
+                if event_data is None:
+                    return
                 self._send_event(event_data)
-                self._queue.task_done()
-            except Empty:
-                continue
             except Exception as e:
                 logger.error(f"Worker error: {e}")
+            finally:
+                self._queue.task_done()
 
     def _send_event(self, event_data: Dict[str, Any]) -> None:
         """Send event to API."""
@@ -90,28 +93,26 @@ class EventProcessor:
             logger.error(f"Failed to queue event: {e}")
             return False
 
-    def flush(self) -> None:
-        """Manually flush all queued events."""
+    def flush(self, timeout: float = FLUSH_TIMEOUT_SECONDS) -> bool:
+        """Wait until all queued events have been sent."""
         logger.debug("Manual flush requested")
-
-        # Process all queued events
-        while True:
-            try:
-                event_data = self._queue.get_nowait()
-                self._send_event(event_data)
-                self._queue.task_done()
-            except Empty:
-                break
+        deadline = time.monotonic() + timeout
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(f"flush() timed out with {self._queue.unfinished_tasks} events pending")
+                    return False
+                self._queue.all_tasks_done.wait(remaining)
+        return True
 
     def shutdown(self) -> None:
         """Shutdown processor and flush remaining events."""
         logger.info("Shutting down EventProcessor")
 
-        # Flush remaining events
         self.flush()
-
-        # Signal shutdown
         self._shutdown_event.set()
+        self._queue.put(None)
 
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=5.0)
